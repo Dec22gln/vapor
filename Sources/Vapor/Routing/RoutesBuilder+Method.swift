@@ -1,15 +1,42 @@
+/// Determines how an incoming HTTP request's body is collected. 
 public enum HTTPBodyStreamStrategy {
+    /// The HTTP request's body will be collected into memory up to a maximum size
+    /// before the route handler is called. The application's configured default max body
+    /// size will be used unless otherwise specified.
+    ///
+    /// See `collect(maxSize:)` to specify a custom max collection size.
     public static var collect: HTTPBodyStreamStrategy {
-        return .collect(maxSize: 2 << 14)
+        return .collect(maxSize: nil)
     }
+
+    /// The HTTP request's body will not be collected first before the route handler is called
+    /// and will arrive in zero or more chunks.
     case stream
-    case collect(maxSize: Int)
+
+    /// The HTTP request's body will be collected into memory before the route handler is
+    /// called.
+    ///
+    /// `maxSize` Limits the maximum amount of memory in bytes that will be used to
+    /// collect a streaming body. Streaming requests exceeding that size will result in an error.
+    /// Passing `nil` results in the application's default max body size being used. This
+    /// parameter does not affect non-streaming requests.
+    case collect(maxSize: ByteCount?)
 }
 
 extension RoutesBuilder {
     @discardableResult
     public func get<Response>(
         _ path: PathComponent...,
+        use closure: @escaping (Request) throws -> Response
+    ) -> Route
+        where Response: ResponseEncodable
+    {
+        return self.on(.GET, path, use: closure)
+    }
+
+    @discardableResult
+    public func get<Response>(
+        _ path: [PathComponent],
         use closure: @escaping (Request) throws -> Response
     ) -> Route
         where Response: ResponseEncodable
@@ -28,8 +55,28 @@ extension RoutesBuilder {
     }
     
     @discardableResult
+    public func post<Response>(
+        _ path: [PathComponent],
+        use closure: @escaping (Request) throws -> Response
+    ) -> Route
+        where Response: ResponseEncodable
+    {
+        return self.on(.POST, path, use: closure)
+    }
+    
+    @discardableResult
     public func patch<Response>(
         _ path: PathComponent...,
+        use closure: @escaping (Request) throws -> Response
+    ) -> Route
+        where Response: ResponseEncodable
+    {
+        return self.on(.PATCH, path, use: closure)
+    }
+    
+    @discardableResult
+    public func patch<Response>(
+        _ path: [PathComponent],
         use closure: @escaping (Request) throws -> Response
     ) -> Route
         where Response: ResponseEncodable
@@ -45,6 +92,36 @@ extension RoutesBuilder {
         where Response: ResponseEncodable
     {
         return self.on(.PUT, path, use: closure)
+    }
+    
+    @discardableResult
+    public func put<Response>(
+        _ path: [PathComponent],
+        use closure: @escaping (Request) throws -> Response
+    ) -> Route
+        where Response: ResponseEncodable
+    {
+        return self.on(.PUT, path, use: closure)
+    }
+    
+    @discardableResult
+    public func delete<Response>(
+        _ path: PathComponent...,
+        use closure: @escaping (Request) throws -> Response
+    ) -> Route
+        where Response: ResponseEncodable
+    {
+        return self.on(.DELETE, path, use: closure)
+    }
+    
+    @discardableResult
+    public func delete<Response>(
+        _ path: [PathComponent],
+        use closure: @escaping (Request) throws -> Response
+    ) -> Route
+        where Response: ResponseEncodable
+    {
+        return self.on(.DELETE, path, use: closure)
     }
     
     @discardableResult
@@ -72,8 +149,10 @@ extension RoutesBuilder {
     {
         let responder = BasicResponder { request in
             if case .collect(let max) = body, request.body.data == nil {
-                return request.body.collect(max: max).flatMapThrowing { _ in
-                    return try closure(request)
+                return request.body.collect(
+                    max: max?.value ?? request.application.routes.defaultMaxBodySize.value
+                ).flatMapThrowing { _ in
+                    try closure(request)
                 }.encodeResponse(for: request)
             } else {
                 return try closure(request)

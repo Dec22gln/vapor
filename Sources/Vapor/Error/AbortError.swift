@@ -8,21 +8,33 @@
 ///
 ///     throw Abort(.badRequest, reason: "Something's not quite right...")
 ///
-public protocol AbortError: Error, CustomStringConvertible {
+public protocol AbortError: Error {
+    /// The reason for this error.
+    var reason: String { get }
+
     /// The HTTP status code this error will return.
     var status: HTTPResponseStatus { get }
 
     /// Optional `HTTPHeaders` to add to the error response.
     var headers: HTTPHeaders { get }
-
-    /// The human-readable (and hopefully understandable) reason for this error.
-    var reason: String { get }
 }
 
 extension AbortError {
     /// See `AbortError`.
     public var headers: HTTPHeaders {
-        return [:]
+        [:]
+    }
+
+    /// See `AbortError`.
+    public var reason: String {
+        self.status.reasonPhrase
+    }
+}
+
+extension AbortError where Self: DebuggableError {
+    /// See `DebuggableError`.
+    public var identifier: String {
+        self.status.code.description
     }
 }
 
@@ -54,7 +66,8 @@ extension DecodingError: AbortError {
     /// See `AbortError.reason`
     public var reason: String {
         switch self {
-        case .dataCorrupted(let ctx): return ctx.debugDescription
+        case .dataCorrupted(let ctx):
+            return "\(ctx.debugDescription) for key \(ctx.codingPath.dotPath)"
         case .keyNotFound(let key, let ctx):
             let path: String
             if ctx.codingPath.count > 0 {

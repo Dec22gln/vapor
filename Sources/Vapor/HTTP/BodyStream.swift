@@ -10,6 +10,42 @@ public enum BodyStreamResult {
     case end
 }
 
+extension BodyStreamResult: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .buffer(let buffer):
+            return "buffer(\(buffer.readableBytes) bytes)"
+        case .error(let error):
+            return "error(\(error))"
+        case .end:
+            return "end"
+        }
+    }
+}
+
+extension BodyStreamResult: CustomDebugStringConvertible {
+    public var debugDescription: String {
+        switch self {
+        case .buffer(let buffer):
+            let value = String(decoding: buffer.readableBytesView, as: UTF8.self)
+            return "buffer(\(value))"
+        case .error(let error):
+            return "error(\(error))"
+        case .end:
+            return "end"
+        }
+    }
+}
+
 public protocol BodyStreamWriter {
-    func write(_ result: BodyStreamResult)
+    var eventLoop: EventLoop { get }
+    func write(_ result: BodyStreamResult, promise: EventLoopPromise<Void>?)
+}
+
+extension BodyStreamWriter {
+    public func write(_ result: BodyStreamResult) -> EventLoopFuture<Void> {
+        let promise = self.eventLoop.makePromise(of: Void.self)
+        self.write(result, promise: promise)
+        return promise.futureResult
+    }
 }

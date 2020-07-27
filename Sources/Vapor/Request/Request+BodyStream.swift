@@ -1,83 +1,56 @@
 extension Request {
     final class BodyStream: BodyStreamWriter {
-        /// Handles an incoming `HTTPChunkedStreamResult`.
-        typealias Handler = (BodyStreamResult) -> ()
-        
-        /// If `true`, this `HTTPChunkedStream` has already sent an `end` chunk.
+        let eventLoop: EventLoop
+
+        var isBeingRead: Bool {
+            self.handler != nil
+        }
+
         private(set) var isClosed: Bool
-        
-        /// This stream's `HTTPChunkedHandler`, if one is set.
-        private var handler: Handler?
-        
-        /// If a `handler` has not been set when `write(_:)` is called, this property
-        /// is used to store the waiting data.
-        private var buffer: [BodyStreamResult]
-        
-        /// Creates a new `HTTPChunkedStream`.
-        ///
-        /// - parameters:
-        ///     - worker: `Worker` to complete futures on.
-        init() {
+        private var handler: ((BodyStreamResult, EventLoopPromise<Void>?) -> ())?
+        private var buffer: [(BodyStreamResult, EventLoopPromise<Void>?)]
+
+        init(on eventLoop: EventLoop) {
+            self.eventLoop = eventLoop
             self.isClosed = false
             self.buffer = []
         }
-        
-        /// Sets a handler for reading `HTTPChunkedStreamResult`s from the stream.
-        ///
-        ///     chunkedStream.read { res, stream in
-        ///         print(res) // prints the chunk
-        ///         return .done(on: stream) // you can do async work or just return done
-        ///     }
-        ///
-        /// - parameters:
-        ///     - handler: `HTTPChunkedHandler` to use for receiving chunks from this stream.
-        func read(_ handler: @escaping Handler) {
+
+        func read(_ handler: @escaping (BodyStreamResult, EventLoopPromise<Void>?) -> ()) {
             self.handler = handler
-            for item in self.buffer {
-                handler(item)
+            for (result, promise) in self.buffer {
+                handler(result, promise)
             }
             self.buffer = []
         }
-        
-        /// Writes a `HTTPChunkedStreamResult` to the stream.
-        ///
-        ///     try chunkedStream.write(.end).wait()
-        ///
-        /// You must wait for the returned `Future` to complete before writing additional data.
-        ///
-        /// - parameters:
-        ///     - chunk: A `HTTPChunkedStreamResult` to write to the stream.
-        /// - returns: A `Future` that will be completed when the write was successful.
-        ///            You must wait for this future to complete before calling `write(_:)` again.
-        func write(_ chunk: BodyStreamResult) {
-            if case .end = chunk {
+
+        func write(_ chunk: BodyStreamResult, promise: EventLoopPromise<Void>?) {
+            switch chunk {
+            case .end, .error:
                 self.isClosed = true
+            case .buffer: break
             }
             
-            if let handler = handler {
-                handler(chunk)
+            if let handler = self.handler {
+                handler(chunk, promise)
+                // remove reference to handler
+                switch chunk {
+                case .end, .error:
+                    self.handler = nil
+                default: break
+                }
             } else {
-                self.buffer.append(chunk)
+                self.buffer.append((chunk, promise))
             }
         }
-        
-        /// Reads all `HTTPChunkedStreamResult`s from this stream until `end` is received.
-        /// The output is combined into a single `Data`.
-        ///
-        ///     let data = try stream.drain(max: ...).wait()
-        ///     print(data) // Data
-        ///
-        /// - parameters:
-        ///     - max: The maximum number of bytes to allow before throwing an error.
-        ///            Use this to prevent using excessive memory on your server.
-        /// - returns: `Future` containing the collected `Data`.
-        func consume(max: Int, on eventLoop: EventLoop) -> EventLoopFuture<ByteBuffer> {
+
+        func consume(max: Int?, on eventLoop: EventLoop) -> EventLoopFuture<ByteBuffer> {
             let promise = eventLoop.makePromise(of: ByteBuffer.self)
             var data = ByteBufferAllocator().buffer(capacity: 0)
-            self.read { chunk in
+            self.read { chunk, next in
                 switch chunk {
                 case .buffer(var buffer):
-                    if data.readableBytes + buffer.readableBytes >= max {
+                    if let max = max, data.readableBytes + buffer.readableBytes >= max {
                         promise.fail(Abort(.payloadTooLarge))
                     } else {
                         data.writeBuffer(&buffer)
@@ -85,8 +58,13 @@ extension Request {
                 case .error(let error): promise.fail(error)
                 case .end: promise.succeed(data)
                 }
+                next?.succeed(())
             }
             return promise.futureResult
+        }
+
+        deinit {
+            assert(self.isClosed, "Request.BodyStream deinitialized before closing.")
         }
     }
 }

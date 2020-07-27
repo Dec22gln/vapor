@@ -1,7 +1,12 @@
 extension Response {
-    /// Represents an `HTTPMessage`'s body.
+    struct BodyStream {
+        let count: Int
+        let callback: (BodyStreamWriter) -> ()
+    }
+
+    /// Represents a `Response`'s body.
     ///
-    ///     let body = HTTPBody(string: "Hello, world!")
+    ///     let body = Response.Body(string: "Hello, world!")
     ///
     /// This can contain any data (streaming or static) and should match the message's `"Content-Type"` header.
     public struct Body: CustomStringConvertible, ExpressibleByStringLiteral {
@@ -17,7 +22,7 @@ extension Response {
             case stream(BodyStream)
         }
         
-        /// An empty `HTTPBody`.
+        /// An empty `Response.Body`.
         public static let empty: Body = .init()
         
         public var string: String? {
@@ -32,7 +37,7 @@ extension Response {
         }
         
         /// The size of the HTTP body's data.
-        /// `nil` is a stream.
+        /// `-1` is a chunked stream.
         public var count: Int {
             switch self.storage {
             case .data(let data): return data.count
@@ -79,6 +84,18 @@ extension Response {
                 return buffer
             case .none: return nil
             case .stream: return nil
+            }
+        }
+
+        public func collect(on eventLoop: EventLoop) -> EventLoopFuture<ByteBuffer?> {
+            switch self.storage {
+            case .stream(let stream):
+                let collector = ResponseBodyCollector(eventLoop: eventLoop)
+                stream.callback(collector)
+                return collector.promise.futureResult
+                    .map { $0 }
+            default:
+                return eventLoop.makeSucceededFuture(self.buffer)
             }
         }
         
@@ -130,6 +147,10 @@ extension Response {
         public init(stream: @escaping (BodyStreamWriter) -> (), count: Int) {
             self.storage = .stream(.init(count: count, callback: stream))
         }
+
+        public init(stream: @escaping (BodyStreamWriter) -> ()) {
+            self.init(stream: stream, count: -1)
+        }
         
         /// `ExpressibleByStringLiteral` conformance.
         public init(stringLiteral value: String) {
@@ -141,5 +162,28 @@ extension Response {
             self.storage = storage
         }
     }
+}
 
+private final class ResponseBodyCollector: BodyStreamWriter {
+    var buffer: ByteBuffer
+    var eventLoop: EventLoop
+    var promise: EventLoopPromise<ByteBuffer>
+
+    init(eventLoop: EventLoop) {
+        self.buffer = ByteBufferAllocator().buffer(capacity: 0)
+        self.eventLoop = eventLoop
+        self.promise = self.eventLoop.makePromise(of: ByteBuffer.self)
+    }
+
+    func write(_ result: BodyStreamResult, promise: EventLoopPromise<Void>?) {
+        switch result {
+        case .buffer(var buffer):
+            self.buffer.writeBuffer(&buffer)
+        case .error(let error):
+            self.promise.fail(error)
+        case .end:
+            self.promise.succeed(self.buffer)
+        }
+        promise?.succeed(())
+    }
 }

@@ -1,5 +1,15 @@
 import NIO
 
+extension Request {
+    public var fileio: FileIO {
+        return .init(
+            io: self.application.fileio,
+            allocator: self.application.allocator,
+            request: self
+        )
+    }
+}
+
 // MARK: FileIO
 
 /// `FileIO` is a convenience wrapper around SwiftNIO's `NonBlockingFileIO`.
@@ -30,17 +40,17 @@ public struct FileIO {
 
     /// ByteBufferAllocator to use for generating buffers.
     private let allocator: ByteBufferAllocator
-
-    /// Event loop for async work.
-    public let eventLoop: EventLoop
+    
+    /// HTTP request context.
+    private let request: Request
 
     /// Creates a new `FileIO`.
     ///
     /// See `Request.fileio()` to create one.
-    internal init(io: NonBlockingFileIO, allocator: ByteBufferAllocator, on eventLoop: EventLoop) {
+    internal init(io: NonBlockingFileIO, allocator: ByteBufferAllocator, request: Request) {
         self.io = io
         self.allocator = allocator
-        self.eventLoop = eventLoop
+        self.request = request
     }
 
     /// Reads the contents of a file at the supplied path.
@@ -49,13 +59,14 @@ public struct FileIO {
     ///     print(data) // file data
     ///
     /// - parameters:
-    ///     - file: Path to file on the disk.
+    ///     - path: Path to file on the disk.
     /// - returns: `Future` containing the file data.
-    public func collectFile(at file: String) -> EventLoopFuture<ByteBuffer> {
+    public func collectFile(at path: String) -> EventLoopFuture<ByteBuffer> {
         var data = self.allocator.buffer(capacity: 0)
-        return self.readFile(at: file) { new in
+        return self.readFile(at: path) { new in
             var new = new
             data.writeBuffer(&new)
+            return self.request.eventLoop.makeSucceededFuture(())
         }.map { data }
     }
 
@@ -66,16 +77,20 @@ public struct FileIO {
     ///     }.wait()
     ///
     /// - parameters:
-    ///     - file: Path to file on the disk.
+    ///     - path: Path to file on the disk.
     ///     - chunkSize: Maximum size for the file data chunks.
     ///     - onRead: Closure to be called sequentially for each file data chunk.
     /// - returns: `Future` that will complete when the file read is finished.
-    public func readFile(at path: String, chunkSize: Int = NonBlockingFileIO.defaultChunkSize, onRead: @escaping (ByteBuffer) -> Void) -> EventLoopFuture<Void> {
+    public func readFile(
+        at path: String,
+        chunkSize: Int = NonBlockingFileIO.defaultChunkSize,
+        onRead: @escaping (ByteBuffer) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Void> {
         guard
             let attributes = try? FileManager.default.attributesOfItem(atPath: path),
             let fileSize = attributes[.size] as? NSNumber
         else {
-            return self.eventLoop.makeFailedFuture(Abort(.internalServerError))
+            return self.request.eventLoop.makeFailedFuture(Abort(.internalServerError))
         }
         return self.read(path: path, fileSize: fileSize.intValue, chunkSize: chunkSize, onRead: onRead)
     }
@@ -90,11 +105,11 @@ public struct FileIO {
     ///     }
     ///
     /// - parameters:
-    ///     - file: Path to file on the disk.
+    ///     - path: Path to file on the disk.
     ///     - req: `HTTPRequest` to parse `"If-None-Match"` header from.
     ///     - chunkSize: Maximum size for the file data chunks.
     /// - returns: A `200 OK` response containing the file stream and appropriate headers.
-    public func streamFile(at path: String, for request: Request, chunkSize: Int = NonBlockingFileIO.defaultChunkSize) -> Response {
+    public func streamFile(at path: String, chunkSize: Int = NonBlockingFileIO.defaultChunkSize) -> Response {
         // Get file attributes for this file.
         guard
             let attributes = try? FileManager.default.attributesOfItem(atPath: path),
@@ -112,7 +127,7 @@ public struct FileIO {
         headers.replaceOrAdd(name: .eTag, value: fileETag)
 
         // Check if file has been cached already and return NotModified response if the etags match
-        if fileETag == request.headers.firstValue(name: .ifNoneMatch) {
+        if fileETag == request.headers.first(name: .ifNoneMatch) {
             return Response(status: .notModified)
         }
 
@@ -130,13 +145,13 @@ public struct FileIO {
 
         response.body = .init(stream: { stream in
             self.read(path: path, fileSize: fileSize, chunkSize: chunkSize) { chunk in
-                stream.write(.buffer(chunk))
+                return stream.write(.buffer(chunk))
             }.whenComplete { result in
                 switch result {
                 case .failure(let error):
-                    stream.write(.error(error))
+                    stream.write(.error(error), promise: nil)
                 case .success:
-                    stream.write(.end)
+                    stream.write(.end, promise: nil)
                 }
             }
         }, count: fileSize)
@@ -146,19 +161,51 @@ public struct FileIO {
 
     /// Private read method. `onRead` closure uses ByteBuffer and expects future return.
     /// There may be use in publicizing this in the future for reads that must be async.
-    private func read(path: String, fileSize: Int, chunkSize: Int, onRead: @escaping (ByteBuffer) -> ()) -> EventLoopFuture<Void> {
+    private func read(
+        path: String,
+        fileSize: Int,
+        chunkSize: Int,
+        onRead: @escaping (ByteBuffer) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Void> {
         do {
             let fd = try NIOFileHandle(path: path)
-            let done = self.io.readChunked(fileHandle: fd, byteCount: fileSize, chunkSize: chunkSize, allocator: allocator, eventLoop: eventLoop) { chunk in
-                onRead(chunk)
-                return self.eventLoop.makeSucceededFuture(())
+            let done = self.io.readChunked(
+                fileHandle: fd,
+                byteCount: fileSize,
+                chunkSize: chunkSize,
+                allocator: allocator,
+                eventLoop: self.request.eventLoop
+            ) { chunk in
+                return onRead(chunk)
             }
             done.whenComplete { _ in
                 try? fd.close()
             }
             return done
         } catch {
-            return eventLoop.makeFailedFuture(error)
+            return self.request.eventLoop.makeFailedFuture(error)
+        }
+    }
+    
+    /// Write the contents of buffer to a file at the supplied path.
+    ///
+    ///     let data = ByteBuffer(string: "ByteBuffer")
+    ///     try req.fileio.writeFile(data, at: "/path/to/file.txt").wait()
+    ///
+    /// - parameters:
+    ///     - path: Path to file on the disk.
+    ///     - buffer: The `ByteBuffer` to write.
+    /// - returns: `Future` that will complete when the file write is finished.
+    public func writeFile(_ buffer: ByteBuffer, at path: String) -> EventLoopFuture<Void> {
+        do {
+            let fd = try NIOFileHandle(path: path, mode: .write, flags: .allowFileCreation())
+            let done = io.write(fileHandle: fd, buffer: buffer, eventLoop: self.request.eventLoop)
+            done.whenComplete { _ in
+                try? fd.close()
+            }
+            return done
+        } catch {
+            return self.request.eventLoop.makeFailedFuture(error)
         }
     }
 }

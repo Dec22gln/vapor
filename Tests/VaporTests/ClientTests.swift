@@ -1,109 +1,179 @@
 import Vapor
 import XCTest
 
-class ClientTests: XCTestCase {
-//    func testClientBasicRedirect() throws {
-//        let app = try Application()
-//
-//        let client = try app.make(Client.self)
-//
-//        let response = try client.get("http://www.google.com/").wait()
-//        XCTAssertEqual(response.http.status.code, 200)
-//    }
-//
-//    func testClientRelativeRedirect() throws {
-//        let app = try Application()
-//
-//        let client = try app.make(Client.self)
-//
-//        let response = try client.get("http://httpbin.org/relative-redirect/5").wait()
-//        XCTAssertEqual(response.http.status.code, 200)
-//    }
-//
-//    func testClientManyRelativeRedirect() throws {
-//        let app = try Application()
-//
-//        let client = try app.make(Client.self)
-//
-//        let response = try client.get("http://httpbin.org/relative-redirect/8").wait()
-//        XCTAssertEqual(response.http.status.code, 200)
-//    }
-//
-//    func testClientAbsoluteRedirect() throws {
-//        let app = try Application()
-//
-//        let client = try app.make(Client.self)
-//        print(type(of: client))
-//
-//        let response = try client.get("http://httpbin.org/absolute-redirect/5").wait()
-//        XCTAssertEqual(response.http.status.code, 200)
-//    }
-//
-//    func testClientManyAbsoluteRedirect() throws {
-//        let app = try Application()
-//
-//        let client = try app.make(Client.self)
-//
-//        let response = try client.get("http://httpbin.org/absolute-redirect/8").wait()
-//        XCTAssertEqual(response.http.status.code, 200)
-//    }
-//
-//    func testClientHeaders() throws {
-//        let app = try Application()
-//        let fakeClient = LastRequestClient(container: app)
-//        _ = try fakeClient.send(.POST, headers: ["foo": "bar"], to: "/baz") { try $0.content.encode("hello") }.wait()
-//        if let lastReq = fakeClient.lastReq {
-//            XCTAssertEqual(lastReq.http.headers["foo"].first, "bar")
-//            XCTAssertEqual(lastReq.http.url.path, "/baz")
-//            XCTAssertEqual(lastReq.http.body.data, Data("hello".utf8))
-//        } else {
-//            XCTFail("No last request")
-//        }
-//    }
-//
-//    func testClientItunesAPI() throws {
-//        let app = try Application()
-//        let client = try app.make(Client.self)
-//        let res = try client.send(.GET, to: "https://itunes.apple.com/search?term=mapstr&country=fr&entity=software&limit=1").wait()
-//        let data = res.http.body.data ?? Data()
-//        XCTAssertEqual(String(data: data, encoding: .ascii)?.contains("iPhone"), true)
-//    }
-//
-//    func testFoundationClientItunesAPI() throws {
-//        var config = Config.default()
-//        config.prefer(FoundationClient.self, for: Client.self)
-//        let app = try Application(config: config)
-//        let client = try app.make(Client.self)
-//        XCTAssert(client is FoundationClient)
-//        let res = try client.send(.GET, to: "https://itunes.apple.com/search?term=mapstr&country=fr&entity=software&limit=1").wait()
-//        let data = res.http.body.data ?? Data()
-//        XCTAssertEqual(String(data: data, encoding: .ascii)?.contains("iPhone"), true)
-//    }
-//
-//    static let allTests = [
-//        ("testClientBasicRedirect", testClientBasicRedirect),
-//        ("testClientRelativeRedirect", testClientRelativeRedirect),
-//        ("testClientManyRelativeRedirect", testClientManyRelativeRedirect),
-//        ("testClientAbsoluteRedirect", testClientAbsoluteRedirect),
-//        ("testClientManyAbsoluteRedirect", testClientManyAbsoluteRedirect),
-//        ("testClientHeaders", testClientHeaders),
-//        ("testClientItunesAPI", testClientItunesAPI),
-//        ("testFoundationClientItunesAPI", testFoundationClientItunesAPI),
-//    ]
+final class ClientTests: XCTestCase {
+    func testClientConfigurationChange() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.http.client.configuration.redirectConfiguration = .disallow
+
+        app.get("redirect") {
+            $0.redirect(to: "foo")
+        }
+
+        try app.server.start(hostname: "localhost", port: 8080)
+        defer { app.server.shutdown() }
+
+        let res = try app.client.get("http://localhost:8080/redirect").wait()
+
+        XCTAssertEqual(res.status, .seeOther)
+    }
+    
+    func testClientConfigurationCantBeChangedAfterClientHasBeenUsed() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.http.client.configuration.redirectConfiguration = .disallow
+
+        app.get("redirect") {
+            $0.redirect(to: "foo")
+        }
+
+        try app.server.start(hostname: "localhost", port: 8080)
+        defer { app.server.shutdown() }
+
+        _ = try app.client.get("http://localhost:8080/redirect").wait()
+        
+        app.http.client.configuration.redirectConfiguration = .follow(max: 1, allowCycles: false)
+        let res = try app.client.get("http://localhost:8080/redirect").wait()
+        XCTAssertEqual(res.status, .seeOther)
+    }
+
+    func testClientResponseCodable() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        let res = try app.client.get("https://httpbin.org/json").wait()
+
+        let encoded = try JSONEncoder().encode(res)
+        let decoded = try JSONDecoder().decode(ClientResponse.self, from: encoded)
+        
+        XCTAssertEqual(res, decoded)
+    }
+    
+    func testClientBeforeSend() throws {
+        let app = Application()
+        defer { app.shutdown() }
+        try app.boot()
+        
+        let res = try app.client.post("http://httpbin.org/anything") { req in
+            try req.content.encode(["hello": "world"])
+        }.wait()
+
+        struct HTTPBinAnything: Codable {
+            var headers: [String: String]
+            var json: [String: String]
+        }
+        let data = try res.content.decode(HTTPBinAnything.self)
+        XCTAssertEqual(data.json, ["hello": "world"])
+        XCTAssertEqual(data.headers["Content-Type"], "application/json; charset=utf-8")
+    }
+    
+    func testBoilerplateClient() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.get("foo") { req -> EventLoopFuture<String> in
+            return req.client.get("https://httpbin.org/status/201").map { res in
+                XCTAssertEqual(res.status.code, 201)
+                req.application.running?.stop()
+                return "bar"
+            }.flatMapErrorThrowing {
+                req.application.running?.stop()
+                throw $0
+            }
+        }
+
+        try app.boot()
+        try app.start()
+
+        let res = try app.client.get("http://localhost:8080/foo").wait()
+        XCTAssertEqual(res.body?.string, "bar")
+
+        try app.running?.onStop.wait()
+    }
+    
+    func testApplicationClientThreadSafety() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        let startingPistol = DispatchGroup()
+        startingPistol.enter()
+        startingPistol.enter()
+
+        let finishLine = DispatchGroup()
+        finishLine.enter()
+        Thread.async {
+            startingPistol.leave()
+            startingPistol.wait()
+            XCTAssert(type(of: app.http.client.shared) == HTTPClient.self)
+            finishLine.leave()
+        }
+
+        finishLine.enter()
+        Thread.async {
+            startingPistol.leave()
+            startingPistol.wait()
+            XCTAssert(type(of: app.http.client.shared) == HTTPClient.self)
+            finishLine.leave()
+        }
+
+        finishLine.wait()
+    }
+
+    func testCustomClient() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.clients.use(.custom)
+        _ = try app.client.get("https://vapor.codes").wait()
+
+        XCTAssertEqual(app.customClient.requests.count, 1)
+        XCTAssertEqual(app.customClient.requests.first?.url.host, "vapor.codes")
+    }
 }
 
-/// MARK: Utilities
-//
-//final class LastRequestClient: Client {
-//    var container: Container
-//    var lastReq: Request?
-//    init(container: Container) {
-//        self.container = container
-//    }
-//    func send(_ req: Request) -> Future<Response> {
-//        lastReq = req
-//        return Future.map(on: req) { req.response() }
-//    }
-//}
-//
-//
+private final class CustomClient: Client {
+    var eventLoop: EventLoop {
+        EmbeddedEventLoop()
+    }
+    var requests: [ClientRequest]
+
+    init() {
+        self.requests = []
+    }
+
+    func send(_ request: ClientRequest) -> EventLoopFuture<ClientResponse> {
+        self.requests.append(request)
+        return self.eventLoop.makeSucceededFuture(ClientResponse())
+    }
+
+    func delegating(to eventLoop: EventLoop) -> Client {
+        self
+    }
+}
+
+private extension Application {
+    struct CustomClientKey: StorageKey {
+        typealias Value = CustomClient
+    }
+
+    var customClient: CustomClient {
+        if let existing = self.storage[CustomClientKey.self] {
+            return existing
+        } else {
+            let new = CustomClient()
+            self.storage[CustomClientKey.self] = new
+            return new
+        }
+    }
+}
+
+private extension Application.Clients.Provider {
+    static var custom: Self {
+        .init {
+            $0.clients.use { $0.customClient }
+        }
+    }
+}

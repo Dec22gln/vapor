@@ -1,69 +1,79 @@
-//import Vapor
-//import XCTest
-//
-//class WebSocketTests : XCTestCase {
-//    func testClientServer() throws { }
-//    
-//    func testClientHeaders() throws {
-//        let app = try Application()
-//        
-//        let group = MultiThreadedEventLoopGroup(numberOfThreads: 8)
-//        
-//        let ws = HTTPServer.webSocketUpgrader(shouldUpgrade: { req in
-//            if req.url.path == "/deny" {
-//                return nil
-//            }
-//            guard let _ = req.headers.bearerAuthorization else {
-//                return nil
-//            }
-//            return [:]
-//        }, onUpgrade: { ws, req in
-//            ws.send(req.url.path)
-//            ws.onText { ws, string in
-//                ws.send(string.reversed())
-//                if string == "close" {
-//                    ws.close()
-//                }
-//            }
-//            ws.onBinary { ws, data in
-//                print("data: \(data)")
-//            }
-//            ws.onCloseCode { code in
-//                print("code: \(code)")
-//            }
-//            ws.onClose.always {
-//                print("closed")
-//            }
-//        })
-//        
-//        let server = try HTTPServer.start(
-//            hostname: "127.0.0.1",
-//            port: 8888,
-//            responder: HelloResponder(),
-//            upgraders: [ws],
-//            on: group
-//        ) { error in
-//            XCTFail("\(error)")
-//            }.wait()
-//        
-//        print(server)
-//        let headers:HTTPHeaders = ["Authorization": "Bearer Test-Token"]
-//        let req = Request(http: .init(method: .GET, url: "ws://127.0.0.1:8888", headers: headers), using: app)
-//        
-//        let _ = try app.client().container.make(WebSocketClient.self).webSocketConnect(req).wait()
-//        // uncomment to test websocket server
-//        //try server.onClose.wait()
-//    }
-//    
-//    static let allTests = [
-//        ("testClientServer", testClientServer),
-//        ("testClientHeaders", testClientHeaders)
-//    ]
-//}
-//
-//struct HelloResponder: HTTPServerResponder {
-//    func respond(to request: HTTPRequest, on worker: Worker) -> EventLoopFuture<HTTPResponse> {
-//        let res = HTTPResponse(status: .ok, body: "This is a WebSocket server")
-//        return worker.eventLoop.newSucceededFuture(result: res)
-//    }
-//}
+import Vapor
+import XCTest
+
+final class WebSocketTests: XCTestCase {
+    func testWebSocketClient() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.get("ws") { req -> EventLoopFuture<String> in
+            let promise = req.eventLoop.makePromise(of: String.self)
+            return WebSocket.connect(
+                to: "ws://echo.websocket.org/",
+                on: req.eventLoop
+            ) { ws in
+                ws.send("Hello, world!")
+                ws.onText { ws, text in
+                    promise.succeed(text)
+                    ws.close().cascadeFailure(to: promise)
+                }
+            }.flatMap {
+                return promise.futureResult
+            }
+        }
+
+        try app.testable().test(.GET, "/ws") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "Hello, world!")
+        }
+    }
+
+
+    // https://github.com/vapor/vapor/issues/1997
+    func testWebSocket404() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.http.server.configuration.port = 8085
+
+        app.webSocket("bar") { req, ws in
+            ws.close(promise: nil)
+        }
+
+        try app.start()
+
+        do {
+            try WebSocket.connect(
+                to: "ws://localhost:8085/foo",
+                on: app.eventLoopGroup.next()
+            ) { _ in  }.wait()
+            XCTFail("should have failed")
+        } catch {
+            // pass
+        }
+    }
+
+    // https://github.com/vapor/vapor/issues/2009
+    func testWebSocketServer() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        app.webSocket("foo") { req, ws in
+            ws.send("foo")
+            ws.close(promise: nil)
+        }
+
+        try app.start()
+        let promise = app.eventLoopGroup.next().makePromise(of: String.self)
+        WebSocket.connect(
+            to: "ws://localhost:8080/foo",
+            on: app.eventLoopGroup.next()
+        ) { ws in
+            // do nothing
+            ws.onText { ws, string in
+                promise.succeed(string)
+            }
+        }.cascadeFailure(to: promise)
+
+        try XCTAssertEqual(promise.futureResult.wait(), "foo")
+    }
+}

@@ -1,17 +1,16 @@
-/// Boots the `Application`'s providers then exits successfully.
+/// Boots the `Application` then exits successfully.
 ///
 ///     $ swift run Run boot
 ///     Done.
 ///
 public final class BootCommand: Command {
     /// See `Command`.
-    public struct Signature: CommandSignature { }
+    public struct Signature: CommandSignature {
+        public init() { }
+    }
 
     /// See `Command`.
-    public let signature = Signature()
-
-    /// See `Command`.
-    public var help: String? {
+    public var help: String {
         return "Boots the application's providers."
     }
 
@@ -19,7 +18,7 @@ public final class BootCommand: Command {
     public init() { }
 
     /// See `Command`.
-    public func run(using context: CommandContext<BootCommand>) throws {
+    public func run(using context: CommandContext, signature: Signature) throws {
         context.console.success("Done.")
     }
 }
